@@ -1,0 +1,83 @@
+{
+  "index_patterns": ["tweets-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "refresh_interval": "5s"
+    },
+    "mappings": {
+      "properties": {
+        "timestamp": {
+          "type": "date",
+          "format": "strict_date_optional_time||epoch_millis"
+        },
+        "tweet_id": {
+          "type": "keyword"
+        },
+        "text": {
+          "type": "text",
+          "analyzer": "standard"
+        },
+        "user": {
+          "type": "keyword"
+        },
+        "language": {
+          "type": "keyword"
+        },
+        "sentiment": {
+          "properties": {
+            "score": {
+              "type": "float"
+            },
+            "label": {
+              "type": "keyword"
+            },
+            "confidence": {
+              "type": "float"
+            }
+          }
+        },
+        "keywords": {
+          "type": "keyword"
+        },
+        "entities": {
+          "properties": {
+            "companies": {
+              "type": "keyword"
+            },
+            "countries": {
+              "type": "keyword"
+            },
+            "persons": {
+              "type": "keyword"
+            }
+          }
+        },
+        "location": {
+          "properties": {
+            "country": {
+              "type": "keyword"
+            },
+            "coordinates": {
+              "type": "geo_point"
+            }
+          }
+        },
+        "engagement": {
+          "properties": {
+            "retweets": {
+              "type": "integer"
+            },
+            "likes": {
+              "type": "integer"
+            },
+            "replies": {
+              "type": "integer"
+            }
+          }
+        }
+      }
+    }
+  }
+}

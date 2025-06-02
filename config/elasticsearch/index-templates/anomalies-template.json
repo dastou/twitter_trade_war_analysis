@@ -1,0 +1,52 @@
+{
+  "index_patterns": ["anomalies-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "refresh_interval": "5s"
+    },
+    "mappings": {
+      "properties": {
+        "timestamp": {
+          "type": "date",
+          "format": "strict_date_optional_time||epoch_millis"
+        },
+        "anomaly_id": {
+          "type": "keyword"
+        },
+        "type": {
+          "type": "keyword"
+        },
+        "severity": {
+          "type": "keyword"
+        },
+        "description": {
+          "type": "text"
+        },
+        "metrics": {
+          "properties": {
+            "sentiment_shift": {
+              "type": "float"
+            },
+            "volume_spike": {
+              "type": "float"
+            },
+            "confidence": {
+              "type": "float"
+            }
+          }
+        },
+        "affected_keywords": {
+          "type": "keyword"
+        },
+        "affected_regions": {
+          "type": "keyword"
+        },
+        "alert_sent": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

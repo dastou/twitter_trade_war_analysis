@@ -1,0 +1,641 @@
+import re
+import string
+from typing import Dict, List, Tuple, Optional
+import numpy as np
+import pandas as pd
+from datetime import datetime
+import logging
+from collections import Counter
+import warnings
+warnings.filterwarnings("ignore")
+
+# Imports pour l'analyse de sentiment
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
+import spacy
+from spacy.lang.en.stop_words import STOP_WORDS as EN_STOP_WORDS
+from spacy.lang.fr.stop_words import STOP_WORDS as FR_STOP_WORDS
+
+# Import pour les statistiques textuelles
+import textstat
+
+class AdvancedNLPAnalyzer:
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+        self.setup_models()
+        self.setup_patterns()
+        self.setup_trade_lexicon()
+        
+    def setup_models(self):
+        """Initialise les modèles d'analyse"""
+        try:
+            # VADER pour l'analyse de sentiment (optimisé pour les réseaux sociaux)
+            self.vader_analyzer = SentimentIntensityAnalyzer()
+            
+            # Modèle Transformers pour l'analyse de sentiment avancée
+            try:
+                self.transformer_sentiment = pipeline(
+                    "sentiment-analysis",
+                    model="cardiffnlp/twitter-roberta-base-sentiment-latest",
+                    device=-1  # CPU, changez à 0 pour GPU
+                )
+            except Exception as e:
+                self.logger.warning(f"Primary transformer model not available: {e}, using fallback")
+                try:
+                    self.transformer_sentiment = pipeline(
+                        "sentiment-analysis",
+                        model="distilbert-base-uncased-finetuned-sst-2-english",
+                        device=-1
+                    )
+                except Exception as e2:
+                    self.logger.error(f"Fallback transformer model also failed: {e2}")
+                    self.transformer_sentiment = None
+            
+            # Modèles spaCy pour le traitement linguistique
+            try:
+                self.nlp_en = spacy.load("en_core_web_sm")
+            except OSError:
+                self.logger.warning("English spaCy model not found, using basic tokenization")
+                self.nlp_en = None
+                
+            try:
+                self.nlp_fr = spacy.load("fr_core_news_sm")
+            except OSError:
+                self.logger.warning("French spaCy model not found, using basic tokenization")
+                self.nlp_fr = None
+            
+            self.logger.info("NLP models initialized successfully")
+            
+        except Exception as e:
+            self.logger.error(f"Error initializing NLP models: {e}")
+            raise
+
+    def setup_patterns(self):
+        """Configure les patterns de reconnaissance"""
+        # Patterns pour détecter l'urgence/crise
+        self.urgency_patterns = [
+            r'\b(breaking|urgent|alert|emergency|crisis)\b',
+            r'\b(immediate|critical|severe|massive)\b',
+            r'\b(collapse|crash|plunge|surge|spike)\b',
+            r'[🚨⚡🔥💥⛔🔴⚠️]+'
+        ]
+        
+        # Patterns pour les montants et pourcentages
+        self.financial_patterns = {
+            'percentage': r'(\d+(?:\.\d+)?)\s*%',
+            'currency': r'\$(\d+(?:,\d{3})*(?:\.\d{2})?)\s*(billion|million|trillion)?',
+            'stock_movement': r'\b(up|down|gained|lost|rose|fell|increased|decreased)\b'
+        }
+        
+        # Mots d'intensité
+        self.intensity_words = {
+            'high': ['massive', 'huge', 'enormous', 'tremendous', 'catastrophic', 'devastating'],
+            'medium': ['significant', 'notable', 'considerable', 'substantial', 'major'],
+            'low': ['slight', 'minor', 'small', 'modest', 'limited']
+        }
+
+    def setup_trade_lexicon(self):
+        """Configure le lexique spécialisé commerce international"""
+        self.trade_sentiment_lexicon = {
+            # Mots très positifs dans le contexte commercial
+            'very_positive': {
+                'breakthrough': 2.5, 'agreement': 2.0, 'deal': 1.8, 'cooperation': 1.7,
+                'partnership': 1.6, 'resolution': 1.9, 'success': 1.8, 'progress': 1.5,
+                'win-win': 2.2, 'beneficial': 1.6, 'opportunity': 1.4, 'growth': 1.5
+            },
+            # Mots très négatifs dans le contexte commercial
+            'very_negative': {
+                'war': -2.5, 'crisis': -2.3, 'collapse': -2.8, 'failure': -2.1,
+                'retaliation': -2.0, 'sanctions': -1.9, 'embargo': -2.2, 'tariffs': -1.5,
+                'escalation': -2.1, 'breakdown': -2.0, 'deadlock': -1.8, 'tensions': -1.6,
+                'disruption': -1.7, 'uncertainty': -1.4, 'volatility': -1.3
+            },
+            # Indicateurs de volume/intensité
+            'volume_indicators': {
+                'massive': 1.5, 'huge': 1.4, 'major': 1.3, 'significant': 1.2,
+                'minor': 0.8, 'slight': 0.7, 'limited': 0.6
+            }
+        }
+
+    def detect_language(self, text: str) -> str:
+        """Détecte la langue du texte"""
+        # Mots français communs
+        french_words = {'le', 'la', 'les', 'de', 'du', 'des', 'et', 'est', 'une', 'un', 'dans', 'sur', 'avec', 'pour'}
+        # Mots anglais communs
+        english_words = {'the', 'and', 'is', 'are', 'of', 'to', 'in', 'on', 'with', 'for', 'at', 'by'}
+        
+        words = set(text.lower().split())
+        
+        french_score = len(words & french_words)
+        english_score = len(words & english_words)
+        
+        if french_score > english_score:
+            return 'fr'
+        return 'en'
+
+    def preprocess_text(self, text: str, language: str = 'en') -> Dict[str, any]:
+        """Préprocesse le texte et extrait des features"""
+        try:
+            # Nettoyage de base
+            original_text = text
+            cleaned_text = self.clean_text(text)
+            
+            # Tokenisation selon la langue
+            if language == 'fr' and self.nlp_fr:
+                doc = self.nlp_fr(cleaned_text)
+                stop_words = FR_STOP_WORDS
+            elif language == 'en' and self.nlp_en:
+                doc = self.nlp_en(cleaned_text)
+                stop_words = EN_STOP_WORDS
+            else:
+                # Tokenisation de base si spaCy n'est pas disponible
+                doc = None
+                stop_words = EN_STOP_WORDS if language == 'en' else FR_STOP_WORDS
+            
+            # Extraction des features
+            features = {
+                'original_text': original_text,
+                'cleaned_text': cleaned_text,
+                'language': language,
+                'length': len(original_text),
+                'word_count': len(cleaned_text.split()),
+                'char_count': len(cleaned_text),
+                'sentence_count': max(len(cleaned_text.split('.')), 1),
+                'readability_score': self.calculate_readability(cleaned_text),
+                'urgency_score': self.calculate_urgency_score(original_text),
+                'financial_entities': self.extract_financial_entities(original_text),
+                'entities': self.extract_entities(doc) if doc else {},
+                'keywords': self.extract_keywords(cleaned_text, stop_words),
+                'hashtags': self.extract_hashtags(original_text),
+                'mentions': self.extract_mentions(original_text),
+                'urls': self.extract_urls(original_text)
+            }
+            
+            return features
+            
+        except Exception as e:
+            self.logger.error(f"Error in text preprocessing: {e}")
+            return {
+                'original_text': text,
+                'cleaned_text': text,
+                'language': language,
+                'error': str(e)
+            }
+
+    def clean_text(self, text: str) -> str:
+        """Nettoie le texte pour l'analyse"""
+        if not text:
+            return ""
+            
+        # Supprimer les URLs
+        text = re.sub(r'http\S+|www\S+|https\S+', '', text, flags=re.MULTILINE)
+        
+        # Garder les hashtags et mentions mais les nettoyer
+        text = re.sub(r'#(\w+)', r'\1', text)  # Garder le mot du hashtag
+        text = re.sub(r'@(\w+)', r'', text)    # Supprimer les mentions
+        
+        # Nettoyer les caractères spéciaux mais garder la ponctuation importante
+        text = re.sub(r'[^\w\s\.\!\?\,\-\%\$]', ' ', text)
+        
+        # Normaliser les espaces
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        return text
+
+    def calculate_readability(self, text: str) -> float:
+        """Calcule le score de lisibilité"""
+        try:
+            if not text or len(text.strip()) == 0:
+                return 50.0
+            return textstat.flesch_reading_ease(text)
+        except:
+            return 50.0  # Score neutre par défaut
+
+    def calculate_urgency_score(self, text: str) -> float:
+        """Calcule un score d'urgence basé sur les patterns"""
+        if not text:
+            return 0.0
+            
+        urgency_score = 0.0
+        text_lower = text.lower()
+        
+        for pattern in self.urgency_patterns:
+            matches = len(re.findall(pattern, text_lower, re.IGNORECASE))
+            urgency_score += matches * 0.3
+        
+        # Bonus pour les majuscules (indication d'urgence)
+        caps_ratio = sum(1 for c in text if c.isupper()) / max(len(text), 1)
+        urgency_score += caps_ratio * 0.5
+        
+        # Bonus pour les points d'exclamation
+        exclamation_count = text.count('!')
+        urgency_score += exclamation_count * 0.2
+        
+        return min(urgency_score, 2.0)  # Limité à 2.0
+
+    def extract_financial_entities(self, text: str) -> Dict[str, List]:
+        """Extrait les entités financières"""
+        entities = {
+            'percentages': [],
+            'currencies': [],
+            'stock_movements': []
+        }
+        
+        if not text:
+            return entities
+        
+        try:
+            # Extraction des pourcentages
+            percentages = re.findall(self.financial_patterns['percentage'], text)
+            entities['percentages'] = [float(p) for p in percentages if p]
+            
+            # Extraction des montants en devises
+            currency_matches = re.findall(self.financial_patterns['currency'], text)
+            entities['currencies'] = currency_matches
+            
+            # Extraction des mouvements d'actions
+            movements = re.findall(self.financial_patterns['stock_movement'], text, re.IGNORECASE)
+            entities['stock_movements'] = movements
+        except Exception as e:
+            self.logger.error(f"Error extracting financial entities: {e}")
+        
+        return entities
+
+    def extract_entities(self, doc) -> Dict[str, List]:
+        """Extrait les entités nommées avec spaCy"""
+        if not doc:
+            return {}
+        
+        entities = {
+            'persons': [],
+            'organizations': [],
+            'locations': [],
+            'money': [],
+            'dates': []
+        }
+        
+        try:
+            for ent in doc.ents:
+                if ent.label_ in ['PERSON']:
+                    entities['persons'].append(ent.text)
+                elif ent.label_ in ['ORG']:
+                    entities['organizations'].append(ent.text)
+                elif ent.label_ in ['GPE', 'LOC']:
+                    entities['locations'].append(ent.text)
+                elif ent.label_ in ['MONEY']:
+                    entities['money'].append(ent.text)
+                elif ent.label_ in ['DATE', 'TIME']:
+                    entities['dates'].append(ent.text)
+        except Exception as e:
+            self.logger.error(f"Error extracting entities: {e}")
+        
+        return entities
+
+    def extract_keywords(self, text: str, stop_words: set) -> List[str]:
+        """Extrait les mots-clés importants"""
+        if not text:
+            return []
+            
+        try:
+            words = text.lower().split()
+            
+            # Filtrer les stop words et les mots trop courts
+            keywords = [
+                word for word in words 
+                if len(word) > 3 
+                and word not in stop_words 
+                and word.isalpha()
+            ]
+            
+            # Retourner les mots les plus fréquents (max 10)
+            word_freq = Counter(keywords)
+            return [word for word, count in word_freq.most_common(10)]
+        except Exception as e:
+            self.logger.error(f"Error extracting keywords: {e}")
+            return []
+
+    def extract_hashtags(self, text: str) -> List[str]:
+        """Extrait les hashtags"""
+        if not text:
+            return []
+        try:
+            return re.findall(r'#(\w+)', text)
+        except:
+            return []
+
+    def extract_mentions(self, text: str) -> List[str]:
+        """Extrait les mentions d'utilisateurs"""
+        if not text:
+            return []
+        try:
+            return re.findall(r'@(\w+)', text)
+        except:
+            return []
+
+    def extract_urls(self, text: str) -> List[str]:
+        """Extrait les URLs"""
+        if not text:
+            return []
+        try:
+            return re.findall(r'http\S+|www\S+|https\S+', text)
+        except:
+            return []
+
+    def analyze_sentiment_vader(self, text: str) -> Dict[str, float]:
+        """Analyse de sentiment avec VADER"""
+        try:
+            if not text:
+                return self.get_default_sentiment()
+                
+            scores = self.vader_analyzer.polarity_scores(text)
+            
+            # Classification basée sur le score composé
+            compound = scores['compound']
+            if compound >= 0.05:
+                label = 'positive'
+            elif compound <= -0.05:
+                label = 'negative'
+            else:
+                label = 'neutral'
+            
+            return {
+                'method': 'vader',
+                'label': label,
+                'score': compound,
+                'confidence': abs(compound),
+                'details': {
+                    'positive': scores['pos'],
+                    'neutral': scores['neu'],
+                    'negative': scores['neg']
+                }
+            }
+        except Exception as e:
+            self.logger.error(f"VADER sentiment analysis error: {e}")
+            return self.get_default_sentiment()
+
+    def analyze_sentiment_transformer(self, text: str) -> Dict[str, float]:
+        """Analyse de sentiment avec Transformers"""
+        try:
+            if not text or not self.transformer_sentiment:
+                return self.get_default_sentiment()
+                
+            # Limiter la longueur du texte pour les transformers
+            max_length = 512
+            if len(text) > max_length:
+                text = text[:max_length]
+            
+            result = self.transformer_sentiment(text)[0]
+            
+            # Normaliser les labels
+            label_mapping = {
+                'LABEL_0': 'negative',
+                'LABEL_1': 'neutral', 
+                'LABEL_2': 'positive',
+                'NEGATIVE': 'negative',
+                'POSITIVE': 'positive'
+            }
+            
+            label = label_mapping.get(result['label'], result['label'].lower())
+            score = result['score']
+            
+            # Convertir en score -1 à 1
+            if label == 'positive':
+                normalized_score = score
+            elif label == 'negative':
+                normalized_score = -score
+            else:
+                normalized_score = 0.0
+            
+            return {
+                'method': 'transformer',
+                'label': label,
+                'score': normalized_score,
+                'confidence': score,
+                'details': {
+                    'raw_label': result['label'],
+                    'raw_score': result['score']
+                }
+            }
+        except Exception as e:
+            self.logger.error(f"Transformer sentiment analysis error: {e}")
+            return self.get_default_sentiment()
+
+    def analyze_sentiment_trade_context(self, text: str, features: Dict) -> Dict[str, float]:
+        """Analyse de sentiment spécialisée pour le contexte commercial"""
+        try:
+            if not text:
+                return self.get_default_sentiment()
+                
+            score = 0.0
+            word_count = 0
+            
+            text_lower = text.lower()
+            words = text_lower.split()
+            
+            # Analyser avec le lexique spécialisé
+            for category, word_scores in self.trade_sentiment_lexicon.items():
+                if category in ['very_positive', 'very_negative']:
+                    for word, weight in word_scores.items():
+                        if word in text_lower:
+                            score += weight
+                            word_count += 1
+            
+            # Ajuster selon l'urgence
+            urgency_score = features.get('urgency_score', 0) if features else 0
+            if urgency_score > 1.0:
+                score = score * 1.3  # Amplifier le sentiment en cas d'urgence
+            
+            # Ajuster selon les entités financières
+            financial_entities = features.get('financial_entities', {}) if features else {}
+            percentages = financial_entities.get('percentages', [])
+            movements = financial_entities.get('stock_movements', [])
+            
+            # Si de gros pourcentages sont mentionnés, amplifier
+            if percentages:
+                max_percentage = max(percentages)
+                if max_percentage > 10:
+                    score = score * (1 + max_percentage / 100)
+            
+            # Ajuster selon les mouvements d'actions
+            positive_movements = ['up', 'gained', 'rose', 'increased']
+            negative_movements = ['down', 'lost', 'fell', 'decreased']
+            
+            for movement in movements:
+                if movement.lower() in positive_movements:
+                    score += 0.5
+                elif movement.lower() in negative_movements:
+                    score -= 0.5
+            
+            # Normalisation finale
+            normalized_score = max(-1.0, min(1.0, score / max(word_count, 1)))
+            
+            # Classification
+            if normalized_score >= 0.1:
+                label = 'positive'
+            elif normalized_score <= -0.1:
+                label = 'negative'
+            else:
+                label = 'neutral'
+            
+            return {
+                'method': 'trade_context',
+                'label': label,
+                'score': normalized_score,
+                'confidence': min(abs(normalized_score) + 0.3, 1.0),
+                'details': {
+                    'raw_score': score,
+                    'word_count': word_count,
+                    'urgency_boost': urgency_score > 1.0
+                }
+            }
+        except Exception as e:
+            self.logger.error(f"Trade context sentiment analysis error: {e}")
+            return self.get_default_sentiment()
+
+    def get_default_sentiment(self) -> Dict[str, float]:
+        """Retourne un sentiment par défaut en cas d'erreur"""
+        return {
+            'method': 'default',
+            'label': 'neutral',
+            'score': 0.0,
+            'confidence': 0.0,
+            'details': {}
+        }
+
+    def ensemble_sentiment_analysis(self, text: str, features: Dict) -> Dict[str, any]:
+        """Combine plusieurs méthodes d'analyse pour un résultat plus robuste"""
+        try:
+            if not text:
+                return {
+                    'label': 'neutral',
+                    'score': 0.0,
+                    'confidence': 0.0,
+                    'error': 'Empty text'
+                }
+                
+            # Analyser avec toutes les méthodes
+            vader_result = self.analyze_sentiment_vader(text)
+            transformer_result = self.analyze_sentiment_transformer(text)
+            trade_result = self.analyze_sentiment_trade_context(text, features)
+            
+            # Pondération des méthodes
+            weights = {
+                'vader': 0.3,        # Bon pour les réseaux sociaux
+                'transformer': 0.4,   # Plus précis globalement
+                'trade_context': 0.3  # Spécialisé pour notre domaine
+            }
+            
+            # Calcul du score pondéré
+            weighted_score = (
+                vader_result['score'] * weights['vader'] +
+                transformer_result['score'] * weights['transformer'] +
+                trade_result['score'] * weights['trade_context']
+            )
+            
+            # Calcul de la confiance pondérée
+            weighted_confidence = (
+                vader_result['confidence'] * weights['vader'] +
+                transformer_result['confidence'] * weights['transformer'] +
+                trade_result['confidence'] * weights['trade_context']
+            )
+            
+            # Classification finale
+            if weighted_score >= 0.1:
+                final_label = 'positive'
+            elif weighted_score <= -0.1:
+                final_label = 'negative'
+            else:
+                final_label = 'neutral'
+            
+            # Ajustement de la confiance selon la cohérence des méthodes
+            methods_agreement = self.calculate_methods_agreement(
+                [vader_result, transformer_result, trade_result]
+            )
+            
+            final_confidence = weighted_confidence * methods_agreement
+            
+            return {
+                'label': final_label,
+                'score': weighted_score,
+                'confidence': final_confidence,
+                'methods': {
+                    'vader': vader_result,
+                    'transformer': transformer_result,
+                    'trade_context': trade_result
+                },
+                'agreement_score': methods_agreement,
+                'features_used': features
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Ensemble sentiment analysis error: {e}")
+            return {
+                'label': 'neutral',
+                'score': 0.0,
+                'confidence': 0.0,
+                'error': str(e)
+            }
+
+    def calculate_methods_agreement(self, results: List[Dict]) -> float:
+        """Calcule l'accord entre les différentes méthodes"""
+        try:
+            labels = [r['label'] for r in results]
+            scores = [r['score'] for r in results]
+            
+            # Accord sur les labels
+            label_agreement = len(set(labels)) == 1
+            
+            # Accord sur les scores (écart-type faible = bon accord)
+            score_std = np.std(scores)
+            score_agreement = 1.0 / (1.0 + score_std)
+            
+            # Moyenne pondérée
+            total_agreement = 0.6 * (1.0 if label_agreement else 0.5) + 0.4 * score_agreement
+            
+            return total_agreement
+        except:
+            return 0.5  # Valeur par défaut
+
+    def analyze_text(self, text: str, language: str = None) -> Dict[str, any]:
+        """Méthode principale d'analyse de texte"""
+        try:
+            if not text:
+                return {
+                    'timestamp': datetime.now().isoformat(),
+                    'original_text': '',
+                    'error': 'Empty text',
+                    'sentiment': self.get_default_sentiment()
+                }
+            
+            # Détection de langue si non spécifiée
+            if not language:
+                language = self.detect_language(text)
+            
+            # Préprocessing
+            features = self.preprocess_text(text, language)
+            
+            # Analyse de sentiment
+            sentiment_analysis = self.ensemble_sentiment_analysis(text, features)
+            
+            # Résultat final
+            return {
+                'timestamp': datetime.now().isoformat(),
+                'original_text': text,
+                'language': language,
+                'features': features,
+                'sentiment': sentiment_analysis,
+                'processing_info': {
+                    'analyzer_version': '1.0',
+                    'models_used': ['vader', 'transformers', 'trade_lexicon'],
+                    'processing_time': None  # À calculer si nécessaire
+                }
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Text analysis error: {e}")
+            return {
+                'timestamp': datetime.now().isoformat(),
+                'original_text': text,
+                'error': str(e),
+                'sentiment': self.get_default_sentiment()
+            }
